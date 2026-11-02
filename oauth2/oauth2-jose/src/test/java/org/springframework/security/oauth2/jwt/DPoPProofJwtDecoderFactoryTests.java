@@ -19,18 +19,26 @@ package org.springframework.security.oauth2.jwt;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.function.Function;
 
+import com.nimbusds.jose.jwk.Curve;
+import com.nimbusds.jose.jwk.ECKey;
+import com.nimbusds.jose.jwk.JWK;
 import com.nimbusds.jose.jwk.RSAKey;
+import com.nimbusds.jose.jwk.gen.ECKeyGenerator;
 import com.nimbusds.jose.jwk.source.JWKSource;
 import com.nimbusds.jose.proc.SecurityContext;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import org.springframework.security.oauth2.core.OAuth2TokenValidator;
 import org.springframework.security.oauth2.jose.TestJwks;
 import org.springframework.security.oauth2.jose.jws.SignatureAlgorithm;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
 import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
 import static org.mockito.ArgumentMatchers.any;
@@ -446,6 +454,190 @@ public class DPoPProofJwtDecoderFactoryTests {
 
 		JwtDecoder jwtDecoder = this.jwtDecoderFactory.createDecoder(dPoPProofContext);
 		jwtDecoder.decode(dPoPProof.getTokenValue());
+	}
+
+	@Test
+	public void createDefaultJwtValidatorFactoryWhenValidatorsNullThenThrowIllegalArgumentException() {
+		// @formatter:off
+		assertThatIllegalArgumentException()
+				.isThrownBy(() -> DPoPProofJwtDecoderFactory.createDefaultJwtValidatorFactory(null))
+				.withMessage("validators cannot be null");
+		// @formatter:on
+	}
+
+	@Test
+	public void decodeWhenIatOutsideReplayWindowThenThrowBadJwtException() throws Exception {
+		RSAKey rsaJwk = TestJwks.DEFAULT_RSA_JWK;
+		given(this.jwkSource.get(any(), any())).willReturn(Collections.singletonList(rsaJwk));
+
+		String method = "GET";
+		String targetUri = "https://resource1";
+
+		// @formatter:off
+		Map<String, Object> publicJwk = rsaJwk.toPublicJWK().toJSONObject();
+		JwsHeader jwsHeader = JwsHeader.with(SignatureAlgorithm.RS256)
+				.type("dpop+jwt")
+				.jwk(publicJwk)
+				.build();
+		Instant issuedAt = Instant.now().minus(Duration.ofSeconds(45));		// now minus 45 seconds
+		JwtClaimsSet claims = JwtClaimsSet.builder()
+				.issuedAt(issuedAt)
+				.claim("htm", method)
+				.claim("htu", targetUri)
+				.id(UUID.randomUUID().toString())
+				.build();
+		// @formatter:on
+
+		Jwt dPoPProof = this.jwtEncoder.encode(JwtEncoderParameters.from(jwsHeader, claims));
+
+		// @formatter:off
+		DPoPProofContext dPoPProofContext = DPoPProofContext.withDPoPProof(dPoPProof.getTokenValue())
+				.method(method)
+				.targetUri(targetUri)
+				.build();
+		// @formatter:on
+
+		JwtDecoder jwtDecoder = this.jwtDecoderFactory.createDecoder(dPoPProofContext);
+
+		// @formatter:off
+		assertThatExceptionOfType(BadJwtException.class)
+				.isThrownBy(() -> jwtDecoder.decode(dPoPProofContext.getDPoPProof()))
+				.withMessageContaining("iat claim is invalid");
+		// @formatter:on
+	}
+
+	@Test
+	public void decodeWhenJtiCacheFloodedThenReplayedDPoPProofRejected() throws Exception {
+		RSAKey rsaJwk = TestJwks.DEFAULT_RSA_JWK;
+		given(this.jwkSource.get(any(), any())).willReturn(Collections.singletonList(rsaJwk));
+
+		String method = "GET";
+		String targetUri = "https://resource1";
+
+		Jwt dPoPProof = encodeDPoPProof(this.jwtEncoder, rsaJwk, method, targetUri);
+
+		// @formatter:off
+		DPoPProofContext dPoPProofContext = DPoPProofContext.withDPoPProof(dPoPProof.getTokenValue())
+				.method(method)
+				.targetUri(targetUri)
+				.build();
+		// @formatter:on
+
+		JwtDecoder jwtDecoder = this.jwtDecoderFactory.createDecoder(dPoPProofContext);
+		jwtDecoder.decode(dPoPProof.getTokenValue());
+
+		// Flood the jti cache with DPoP Proofs signed with another key
+		ECKey floodJwk = new ECKeyGenerator(Curve.P_256).keyID("flood-ec-jwk-kid").generate();
+		JWKSource<SecurityContext> floodJwkSource = mock(JWKSource.class);
+		given(floodJwkSource.get(any(), any())).willReturn(Collections.singletonList(floodJwk));
+		NimbusJwtEncoder floodJwtEncoder = new NimbusJwtEncoder(floodJwkSource);
+		for (int i = 0; i < 1000; i++) {
+			Jwt floodDPoPProof = encodeDPoPProof(floodJwtEncoder, floodJwk, method, targetUri);
+			jwtDecoder.decode(floodDPoPProof.getTokenValue());
+		}
+
+		// Replay the DPoP Proof
+		// @formatter:off
+		assertThatExceptionOfType(BadJwtException.class)
+				.isThrownBy(() -> jwtDecoder.decode(dPoPProof.getTokenValue()))
+				.withMessageContaining("jti claim is invalid");
+		// @formatter:on
+	}
+
+	@Test
+	public void decodeWhenDPoPProofInvalidThenJtiNotCached() throws Exception {
+		RSAKey rsaJwk = TestJwks.DEFAULT_RSA_JWK;
+		given(this.jwkSource.get(any(), any())).willReturn(Collections.singletonList(rsaJwk));
+
+		DPoPProofReplayValidator.InMemoryCache cache = new DPoPProofReplayValidator.InMemoryCache();
+		cache.setMaxSize(1);
+		List<OAuth2TokenValidator<Jwt>> validators = List.of(new DPoPProofReplayValidator(cache));
+		// @formatter:off
+		Function<DPoPProofContext, OAuth2TokenValidator<Jwt>> jwtValidatorFactory =
+				DPoPProofJwtDecoderFactory.createDefaultJwtValidatorFactory(validators);
+		// @formatter:on
+		this.jwtDecoderFactory.setJwtValidatorFactory(jwtValidatorFactory);
+
+		String method = "GET";
+		String targetUri = "https://resource1";
+
+		Jwt invalidDPoPProof = encodeDPoPProof(this.jwtEncoder, rsaJwk, method, targetUri);
+
+		// @formatter:off
+		DPoPProofContext invalidDPoPProofContext = DPoPProofContext.withDPoPProof(invalidDPoPProof.getTokenValue())
+				.method(method)
+				.targetUri("https://resource2")		// Mismatch
+				.build();
+		// @formatter:on
+
+		JwtDecoder invalidJwtDecoder = this.jwtDecoderFactory.createDecoder(invalidDPoPProofContext);
+
+		// @formatter:off
+		assertThatExceptionOfType(BadJwtException.class)
+				.isThrownBy(() -> invalidJwtDecoder.decode(invalidDPoPProof.getTokenValue()))
+				.withMessageContaining("The htu claim is not valid");
+		// @formatter:on
+		assertThat((Map<?, ?>) cache.getNativeCache()).isEmpty();
+
+		Jwt dPoPProof = encodeDPoPProof(this.jwtEncoder, rsaJwk, method, targetUri);
+
+		// @formatter:off
+		DPoPProofContext dPoPProofContext = DPoPProofContext.withDPoPProof(dPoPProof.getTokenValue())
+				.method(method)
+				.targetUri(targetUri)
+				.build();
+		// @formatter:on
+
+		JwtDecoder jwtDecoder = this.jwtDecoderFactory.createDecoder(dPoPProofContext);
+		jwtDecoder.decode(dPoPProof.getTokenValue());
+		assertThat((Map<?, ?>) cache.getNativeCache()).hasSize(1);
+	}
+
+	@Test
+	public void decodeWhenAccessTokenBoundToOtherKeyThenThrowBadJwtException() throws Exception {
+		RSAKey rsaJwk = TestJwks.DEFAULT_RSA_JWK;
+		given(this.jwkSource.get(any(), any())).willReturn(Collections.singletonList(rsaJwk));
+
+		String method = "GET";
+		String targetUri = "https://resource1";
+
+		Jwt dPoPProof = encodeDPoPProof(this.jwtEncoder, rsaJwk, method, targetUri);
+
+		String jwkThumbprint = TestJwks.DEFAULT_EC_JWK.toPublicJWK().computeThumbprint().toString();
+		Jwt accessToken = TestJwts.jwt().claim("cnf", Collections.singletonMap("jkt", jwkThumbprint)).build();
+
+		// @formatter:off
+		DPoPProofContext dPoPProofContext = DPoPProofContext.withDPoPProof(dPoPProof.getTokenValue())
+				.method(method)
+				.targetUri(targetUri)
+				.accessToken(accessToken)
+				.build();
+		// @formatter:on
+
+		JwtDecoder jwtDecoder = this.jwtDecoderFactory.createDecoder(dPoPProofContext);
+
+		// @formatter:off
+		assertThatExceptionOfType(BadJwtException.class)
+				.isThrownBy(() -> jwtDecoder.decode(dPoPProofContext.getDPoPProof()))
+				.withMessageContaining("jkt claim is invalid");
+		// @formatter:on
+	}
+
+	private static Jwt encodeDPoPProof(NimbusJwtEncoder jwtEncoder, JWK jwk, String method, String targetUri) {
+		SignatureAlgorithm algorithm = (jwk instanceof ECKey) ? SignatureAlgorithm.ES256 : SignatureAlgorithm.RS256;
+		// @formatter:off
+		JwsHeader jwsHeader = JwsHeader.with(algorithm)
+				.type("dpop+jwt")
+				.jwk(jwk.toPublicJWK().toJSONObject())
+				.build();
+		JwtClaimsSet claims = JwtClaimsSet.builder()
+				.issuedAt(Instant.now())
+				.claim("htm", method)
+				.claim("htu", targetUri)
+				.id(UUID.randomUUID().toString())
+				.build();
+		// @formatter:on
+		return jwtEncoder.encode(JwtEncoderParameters.from(jwsHeader, claims));
 	}
 
 }
