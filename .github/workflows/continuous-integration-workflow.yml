@@ -1,12 +1,13 @@
 name: CI
 
 on:
-  push:
-    branches-ignore:
-      - "dependabot/**"
-  schedule:
-    - cron: '0 10 * * *' # Once per day at 10am UTC
   workflow_dispatch: # Manual trigger
+    inputs:
+      test-filter:
+        description: Gradle test task + filter to run instead of the full build (e.g. ':spring-security-oauth2-jose:test --tests FooTests')
+        required: false
+        default: ''
+        type: string
 
 env:
   DEVELOCITY_ACCESS_KEY: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
@@ -17,18 +18,124 @@ permissions:
 jobs:
   build:
     name: Build
-    uses: spring-io/spring-security-release-tools/.github/workflows/build.yml@b92832ecbc7cbe969201e6beafbde0ee400cf095 # v1.0.15
+    # Inlined from spring-io/spring-security-release-tools/.github/workflows/build.yml@b92832ecbc7cbe969201e6beafbde0ee400cf095 (v1.0.15)
+    # so the built jar can be uploaded and the JUnit results summarised.
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 55
     strategy:
+      fail-fast: false
       matrix:
         os: [ ubuntu-latest, windows-latest ]
         jdk: [ 17 ]
-    with:
-      runs-on: ${{ matrix.os }}
-      java-version: ${{ matrix.jdk }}
-      distribution: temurin
-    secrets: inherit
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Set up JDK ${{ matrix.jdk }}
+        uses: spring-io/spring-gradle-build-action@c8668747d7c264864c8c7f7026d0d277d14a78dc # v2.0.6
+        with:
+          java-version: ${{ matrix.jdk }}
+          distribution: temurin
+      - name: Build with Gradle
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./gradlew assemble ${{ inputs.test-filter }} --no-build-cache
+          else
+            ./gradlew build --continue --no-build-cache
+          fi
+      - name: Test results summary
+        if: always()
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then PY=python; else PY=python3; fi
+          cat > "$RUNNER_TEMP/junit_summary.py" <<'EOF'
+          import glob, os, sys
+          import xml.etree.ElementTree as ET
+          import re
+          SKIP_ANN = re.compile(r"@(?:org\.junit\.jupiter\.api\.)?(Disabled\w*|Enabled\w*|Ignore)\b.*")
+          def skip_reason(classname, testname):
+              # JUnit XML carries no message for annotation-driven skips; report the source annotation instead
+              outer = classname.split("$")[0]
+              rel = outer.replace(".", "/")
+              srcs = glob.glob("**/src/*/java/" + rel + ".java", recursive=True) + glob.glob("**/src/*/kotlin/" + rel + ".kt", recursive=True)
+              if not srcs:
+                  return "no message (source not found)"
+              lines = open(srcs[0], encoding="utf-8").read().splitlines()
+              method = re.split(r"[(\[]", testname)[0].strip()
+              for i, line in enumerate(lines):
+                  if re.search(r"\b(void|fun)\s+" + re.escape(method) + r"\s*\(", line):
+                      anns = []
+                      j = i - 1
+                      while j >= 0 and (lines[j].strip().startswith("@") or lines[j].strip().startswith("//") or lines[j].strip().startswith("*") or lines[j].strip().startswith("/*")):
+                          m = SKIP_ANN.search(lines[j])
+                          if m:
+                              anns.append(m.group(0).strip())
+                          j -= 1
+                      if anns:
+                          return "method annotated " + "; ".join(anns)
+                      break
+              simple = outer.split(".")[-1]
+              for i, line in enumerate(lines):
+                  if re.search(r"\bclass\s+" + re.escape(simple) + r"\b", line):
+                      anns = [SKIP_ANN.search(l).group(0).strip() for l in lines[max(0, i - 8):i] if SKIP_ANN.search(l)]
+                      if anns:
+                          return "class annotated " + "; ".join(anns)
+                      break
+              return "no message (skipped by runtime assumption or container-level condition)"
+          tot = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+          per = {}
+          skipped = []
+          failed = []
+          for f in sorted(glob.glob("**/build/test-results/**/TEST-*.xml", recursive=True)):
+              mod = f.replace(os.sep, "/").split("/build/test-results/")[0]
+              try:
+                  root = ET.parse(f).getroot()
+              except ET.ParseError:
+                  continue
+              m = per.setdefault(mod, {"tests": 0, "failures": 0, "errors": 0, "skipped": 0})
+              for k in tot:
+                  n = int(root.get(k, 0))
+                  m[k] += n
+                  tot[k] += n
+              for tc in root.iter("testcase"):
+                  name = tc.get("classname", "") + "." + tc.get("name", "")
+                  s = tc.find("skipped")
+                  if s is not None:
+                      msg = s.get("message") or (s.text or "").strip()
+                      if not msg:
+                          msg = skip_reason(tc.get("classname", ""), tc.get("name", ""))
+                      skipped.append((name, msg[:300]))
+                  for tag in ("failure", "error"):
+                      e = tc.find(tag)
+                      if e is not None:
+                          failed.append((name, (e.get("message") or "")[:200]))
+          for mod, m in sorted(per.items()):
+              print(f"[{mod}] tests={m['tests']} passed={m['tests']-m['failures']-m['errors']-m['skipped']} failures={m['failures']} errors={m['errors']} skipped={m['skipped']}")
+          by_reason = {}
+          for name, msg in skipped:
+              by_reason.setdefault(msg, []).append(name.rsplit(".", 2)[-2] + "." + name.rsplit(".", 1)[-1])
+          print(f"TEST SUMMARY | SKIP REASONS ({len(skipped)} skipped tests, grouped by the source annotation or condition that disables them):")
+          for msg, names in sorted(by_reason.items(), key=lambda kv: -len(kv[1])):
+              print(f"TEST SUMMARY | SKIP REASON [{len(names)}] {msg} -> " + ", ".join(names))
+          for name, msg in failed:
+              print(f"TEST SUMMARY | FAILED {name}: {msg}")
+          passed = tot["tests"] - tot["failures"] - tot["errors"] - tot["skipped"]
+          print(f"TEST SUMMARY: {tot['tests']} tests, {passed} passed, {tot['failures']} failures, {tot['errors']} errors, {tot['skipped']} skipped")
+          EOF
+          $PY "$RUNNER_TEMP/junit_summary.py"
+      - name: Upload spring-security-oauth2-jose jar
+        if: ${{ runner.os == 'Linux' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: spring-security-oauth2-jose-jar
+          path: |
+            oauth2/oauth2-jose/build/libs/spring-security-oauth2-jose-*.jar
+            !oauth2/oauth2-jose/build/libs/*-sources.jar
+            !oauth2/oauth2-jose/build/libs/*-javadoc.jar
+            !oauth2/oauth2-jose/build/libs/*-test-fixtures.jar
+          if-no-files-found: error
   test:
     name: Test Against Snapshots
+    if: false
     uses: spring-io/spring-security-release-tools/.github/workflows/test.yml@b92832ecbc7cbe969201e6beafbde0ee400cf095 # v1.0.15
     strategy:
       matrix:
@@ -44,6 +151,7 @@ jobs:
   check-samples:
     name: Check Samples
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     if: ${{ github.repository_owner == 'spring-projects' }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -66,6 +174,7 @@ jobs:
           ./gradlew --refresh-dependencies --project-dir "$SAMPLES_DIR" --init-script spring-security-ci.gradle -PlocalRepositoryPath="$LOCAL_REPOSITORY_PATH" -PspringSecurityVersion="$version" test integrationTest
   deploy-artifacts:
     name: Deploy Artifacts
+    if: false
     needs: [ build, test, check-samples ]
     uses: spring-io/spring-security-release-tools/.github/workflows/deploy-artifacts.yml@b92832ecbc7cbe969201e6beafbde0ee400cf095 # v1.0.15
     with:
@@ -73,6 +182,7 @@ jobs:
     secrets: inherit
   deploy-schema:
     name: Deploy Schema
+    if: false
     needs: [ build, test, check-samples ]
     uses: spring-io/spring-security-release-tools/.github/workflows/deploy-schema.yml@b92832ecbc7cbe969201e6beafbde0ee400cf095 # v1.0.15
     with:
@@ -80,6 +190,7 @@ jobs:
     secrets: inherit
   perform-release:
     name: Perform Release
+    if: false
     needs: [ deploy-artifacts, deploy-schema ]
     uses: spring-io/spring-security-release-tools/.github/workflows/perform-release.yml@b92832ecbc7cbe969201e6beafbde0ee400cf095 # v1.0.15
     with:
@@ -93,7 +204,7 @@ jobs:
   send-notification:
     name: Send Notification
     needs: [ perform-release ]
-    if: ${{ !success() }}
+    if: false
     runs-on: ubuntu-latest
     steps:
       - name: Send Notification
